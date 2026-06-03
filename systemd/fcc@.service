@@ -1,0 +1,17 @@
+[Unit]
+Description=free-claude-code proxy (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %i = config dir name under /root/.config (e.g. free-claude-code-mix)
+Environment=FCC_ENV_FILE=/root/.config/%i/.env
+ExecStart=/root/.local/bin/free-claude-code
+WorkingDirectory=/root
+User=root
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

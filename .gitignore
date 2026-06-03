@@ -1,0 +1,10 @@
+# never commit secrets or runtime junk
+__pycache__/
+*.pyc
+*.log
+*.output
+# real env files (only *.env.example templates are tracked)
+*.env
+!env-templates/*.env.example
+# Claude credentials, if ever copied here
+.credentials.json
