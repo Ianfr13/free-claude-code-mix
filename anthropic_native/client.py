@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
+
+from loguru import logger
 
 from core.anthropic.native_messages_request import dump_raw_messages_request
 from providers.anthropic_messages import AnthropicMessagesTransport
@@ -18,6 +21,22 @@ ANTHROPIC_NATIVE_DEFAULT_BASE = "https://api.anthropic.com/v1"
 
 # Beta required for OAuth-subscription bearer tokens to be accepted.
 OAUTH_BETA = "oauth-2025-04-20"
+
+# Shown in place of an Anthropic ``stop_reason: "refusal"`` (a subscription/AUP
+# false-positive on the Opus path). Claude Code renders a ``refusal`` stop_reason
+# as the cryptic "violate our Usage Policy" error and the session gets stuck in a
+# re-trigger loop. We replace it in-stream with this clear note and finish the
+# turn as ``end_turn`` so the user keeps control. The model is NOT switched.
+REFUSAL_CLEAN_MESSAGE = (
+    "⚠️ **Opus recusou este turno** — falso-positivo do filtro de uso (AUP) "
+    "da Anthropic na via de assinatura. O conteúdo não foi processado pelo modelo "
+    "(o proxy mix interceptou o erro de \"Usage Policy\" e o substituiu por esta "
+    "mensagem; **o modelo não foi trocado**).\n\n"
+    "Como seguir:\n"
+    "• **Esc Esc** ou **/rewind** — volte para antes do turno que disparou e reformule.\n"
+    "• **/clear** — comece uma sessão nova (o histórico atual continua re-disparando a recusa).\n"
+    "• **/model sonnet** — rode este turno em outro provedor (DeepSeek), que não passa pelo filtro.\n"
+)
 
 
 def _detected_cli_version() -> str:
@@ -97,6 +116,113 @@ class AnthropicNativeProvider(AnthropicMessagesTransport):
         if thinking.get("enabled"):
             return {"type": "adaptive"}
         return None
+
+    # -- refusal interception ------------------------------------------------
+    @staticmethod
+    def _sse_event_data(event: str) -> dict | None:
+        """Parse the JSON payload of a grouped SSE event.
+
+        Concatenates ALL ``data:`` lines (per the SSE spec, a consumer joins
+        them with newlines) so a payload split across lines still parses — this
+        matches the codebase's own ``parse_sse_lines`` and avoids a latent path
+        where a multi-line refusal event would be missed and passed through.
+        """
+        data_lines: list[str] = []
+        for line in event.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if not data_lines:
+            return None
+        payload = "\n".join(data_lines).strip()
+        if not payload or payload == "[DONE]":
+            return None
+        try:
+            return json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _sse_event(name: str, data: dict) -> str:
+        """Render an SSE event in the same shape as upstream Anthropic events."""
+        return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def _iter_stream_chunks(
+        self, response: Any, *, state: Any, thinking_enabled: bool
+    ):
+        """Event-mode passthrough that turns an Anthropic ``stop_reason:"refusal"``
+        into a clean, explanatory ``end_turn`` message — without switching models.
+
+        The provider is always ``stream_chunk_mode == "event"``, so each upstream
+        SSE event is forwarded whole. When the terminal ``message_delta`` carries
+        ``stop_reason == "refusal"`` we close any open block, inject a fresh text
+        block with :data:`REFUSAL_CLEAN_MESSAGE`, and rewrite the stop_reason to
+        ``end_turn`` so Claude Code shows the note instead of the Usage-Policy
+        error and does not get stuck in the refusal cascade.
+        """
+        next_index = 0
+        open_indices: set[int] = set()
+        async for event in self._iter_sse_events(response):
+            data = self._sse_event_data(event)
+            etype = data.get("type") if isinstance(data, dict) else None
+
+            if etype == "content_block_start":
+                idx = data.get("index")
+                if isinstance(idx, int):
+                    open_indices.add(idx)
+                    next_index = max(next_index, idx + 1)
+            elif etype == "content_block_stop":
+                idx = data.get("index")
+                if isinstance(idx, int):
+                    open_indices.discard(idx)
+            elif etype == "message_delta":
+                delta = data.get("delta") if isinstance(data, dict) else None
+                if isinstance(delta, dict) and delta.get("stop_reason") == "refusal":
+                    logger.warning(
+                        "ANTHROPIC_NATIVE: upstream stop_reason=refusal; replaced "
+                        "with clean message (model unchanged)"
+                    )
+                    # Close any still-open blocks (Anthropic streams sequentially,
+                    # but close all defensively to keep the block stack balanced).
+                    for open_idx in sorted(open_indices):
+                        yield self._sse_event(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": open_idx},
+                        )
+                    open_indices.clear()
+                    idx = next_index
+                    next_index += 1
+                    yield self._sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                    yield self._sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": REFUSAL_CLEAN_MESSAGE,
+                            },
+                        },
+                    )
+                    yield self._sse_event(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": idx},
+                    )
+                    # Rewrite to a clean, self-consistent end_turn delta: drop the
+                    # refusal-only stop_details so the emitted delta isn't contradictory.
+                    delta["stop_reason"] = "end_turn"
+                    delta.pop("stop_details", None)
+                    delta["stop_sequence"] = None
+                    yield self._sse_event("message_delta", data)
+                    continue
+
+            yield event
 
     def _request_headers(self) -> dict[str, str]:
         headers = get_forwarded_client_headers()
